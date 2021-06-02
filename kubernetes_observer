@@ -1,0 +1,176 @@
+#!/bin/bash
+function show_help {
+  echo "Usage: kubernetes_observer (-options) <target> (<node_name>)"
+  echo ""
+  echo "  <target>    target pod or type/name."
+  echo "  <node_name> is only required if there is more than one node"
+  echo "              running on the remote machine."
+  echo ""
+  echo "Options:"
+  echo ""
+  echo "  -e                Start an erlang shell instead of an elixir shell"
+  echo "  -l                Use long names instead of default short names"
+  echo "  -k <cookie>       Set the cookie value"
+  echo "  -h <cookie_home>  Looks for the cookie in <cookie_home>/.erlang.cookie"
+  echo "                    on the remote node"
+  echo "  -p <cookie_path>  Looks for the cookie in <cookie_path> on the remote"
+  echo "                    node"
+  echo "  -o <options>      Set the kubectl options"
+  echo "  -c <container>    Set the Kubernetes cluster namespace"
+  echo ""
+  echo "Example:"
+  echo "  kubernetes_observer -k secret dev_my_k8s_deployment"
+  echo "  kubernetes_observer -p /opt/app/releases/COOKIE dev_my_k8s_deployment"
+  echo ""
+  exit
+}
+
+if [[ "$1" == "" ]]; then
+  show_help
+fi
+
+OPTIND=1
+use_erlang=0
+name=sname
+
+while getopts "?elk:p:h:o:c:" opt; do
+  case "$opt" in
+  \?)
+    show_help
+    exit 0
+    ;;
+  e)
+    use_erlang=1
+    ;;
+  l)
+    name=name
+    ;;
+  k)
+    COOKIE=$OPTARG
+    ;;
+  p)
+    COOKIE_PATH=$OPTARG
+    ;;
+  h)
+    COOKIE_HOME=$OPTARG
+    ;;
+  o)
+    KUBECTL_OPTIONS=$OPTARG
+    ;;
+  c)
+    CONTAINER_NAME="-c $OPTARG"
+    ;;
+  esac
+done
+
+shift $((OPTIND - 1))
+
+target=$1
+remote_do="kubectl $KUBECTL_OPTIONS exec $CONTAINER_NAME $target --"
+
+echo "Starting integration with $target..."
+
+[ "${1:-}" = "--" ] && shift
+
+## Piping EPMD
+if [[ "$ERL_EPMD_PORT" == "" ]]; then
+  echo "Killing local epmd"
+  killall epmd -w 2>/dev/null
+  export ERL_EPMD_PORT="4369"
+fi
+echo "Epmd: $ERL_EPMD_PORT"
+
+echo "Connecting..."
+
+## Tmp dir for socket and config
+tmp_dir=$(mktemp -d)
+echo $"Temp dir created at $tmp_dir"
+function cleanup {
+  echo $1
+  ps aux | grep -i 'port-forward $target' | grep -v grep | awk {'print $2'} | xargs kill 2>/dev/null
+  rm $tmp_dir/erl_inetrc 2>/dev/null
+  rm -rf $tmp_dir
+  exit
+}
+
+function forward_port {
+  output="$tmp_dir/$1"
+  kubectl $KUBECTL_OPTIONS port-forward $target $1 &>$output &
+  pid=$!
+  echo "Forwarding $1 on PID $pid. Waiting for connection"
+  until grep -q -i 'Forwarding from' $output; do
+    if ! ps $pid >/dev/null; then
+      cleanup "The connection could not be established"
+    fi
+    echo -n "."
+    sleep 1
+  done
+  echo
+  echo "Connection established!"
+}
+
+# Unfortunately we can't remap epmd to a different port or we get {error, address}
+# Check erl_epmd:do_get_names/1 implementation
+forward_port $ERL_EPMD_PORT
+
+epmd=$(epmd -names) || cleanup "Couldn't run epmd"
+
+# Ports
+ports=$(echo "$epmd" | tail -n +2 | cut -d' ' -f 5)
+
+# Finding the node name
+names=$(echo "$epmd" | tail -n +2 | cut -d' ' -f 2)
+# If there is more than one remote beam, we need to know which one to connect to
+len=$(echo "$names" | wc -w)
+if [[ "$len" == "0" ]]; then
+  cleanup "Did not find any remote beams"
+elif [[ "$len" == "1" ]]; then
+  node="$names"
+elif [[ "$2" != "" ]]; then
+  node="$2"
+else
+  echo "Identified multiple remote beams:"
+  cleanup "$names"
+fi
+echo "Node: $node"
+
+host=$($remote_do hostname)
+echo "Host: $host"
+
+## Detecting the secret distribution cookie
+if [[ "$COOKIE" == "" ]]; then
+  if [[ "$COOKIE_PATH" == "" ]]; then
+    if [[ "$COOKIE_HOME" == "" ]]; then
+      COOKIE_HOME="~"
+    fi
+    COOKIE_PATH="$COOKIE_HOME/.erlang.cookie"
+  fi
+  echo "Trying to load erlang cookie from $1:$COOKIE_PATH"
+  COOKIE=$($remote_do "cat $COOKIE_PATH")
+fi
+echo "Cookie: ${COOKIE:0:3}*****************"
+
+if [[ "$COOKIE" == "" ]]; then
+  cleanup "Could not determine the cookie"
+fi
+
+## Creating Port mappings for each remote beam
+for port in $ports; do
+  echo "Port: $port"
+  forward_port $port
+done
+
+## Overriding hostname lookup to convince local beam that it's running remote
+export ERL_INETRC=$tmp_dir/erl_inetrc
+echo "{host, {127,0,0,1}, [\"$host\", \"$node@$host\"]}." >$ERL_INETRC
+echo "{edns,0}." >>$ERL_INETRC
+echo "{lookup, [file, dns]}." >>$ERL_INETRC
+
+## Starting up beam
+if [[ $use_erlang == 1 ]]; then
+  erl -remsh "$node@$host" -hidden -setcookie "$COOKIE" "-$name" "remsh_$$@$host" -eval "observer:start()."
+else
+  iex --hidden --cookie "$COOKIE" "--$name" "remsh_$$@$host" --remsh "$node@$host" --eval ":observer.start()"
+fi
+
+cleanup "Done"
