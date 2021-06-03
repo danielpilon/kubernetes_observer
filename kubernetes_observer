@@ -19,8 +19,8 @@ function show_help {
   echo "  -c <container>    Set the Kubernetes cluster namespace"
   echo ""
   echo "Example:"
-  echo "  kubernetes_observer -k secret dev_my_k8s_deployment"
-  echo "  kubernetes_observer -p /opt/app/releases/COOKIE dev_my_k8s_deployment"
+  echo "  kubernetes_observer -k secret my-k8s-pod"
+  echo "  kubernetes_observer -p /opt/app/releases/COOKIE my-k8s-deployment"
   echo ""
   exit
 }
